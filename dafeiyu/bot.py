@@ -2,32 +2,38 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
+import re
 import time
 from datetime import datetime
 
 from .config import Config
 from .ilink import (ERR_REJECTED, ERR_SESSION_EXPIRED, MSG_TYPE_USER, Account, ILinkClient, ILinkError,
                     RateLimiter, extract_text)
-from .llm import LLM, Usage
+from .llm import LLM, LLMResult, Usage
 from .memory import BUBBLE_SEP, PASS_TOKEN, Memory, split_bubbles, strip_markdown
 from .proactive import ProactiveState, decide
 from .store import Store
+from .web import SEARCH_TOOL, Web
 
 log = logging.getLogger(__name__)
 
 TOKEN_TTL_S = 24 * 3600
+# 没真搜过却说"刚刷到/刚翻到/刚看到"，模型老改不掉，主动消息里兜底换掉
+NOT_SEARCHED = re.compile(r"刚(?:刷|翻|看)到")
 
 
 class Bot:
     def __init__(self, cfg: Config, account: Account, ilink: ILinkClient, llm: LLM, store: Store,
-                 clock=time.time, sleep=asyncio.sleep):
+                 clock=time.time, sleep=asyncio.sleep, web: Web | None = None):
         self.cfg = cfg
         self.account = account
         self.ilink = ilink
         self.llm = llm
         self.store = store
+        self.web = web if cfg.web.enabled else None
         self.memory = Memory(cfg, store, llm)
         self.clock = clock
         self.sleep = sleep
@@ -36,6 +42,7 @@ class Bot:
         self._lock = asyncio.Lock()
         self._stop = asyncio.Event()
         self._typing_ticket: tuple[str, str] | None = None  # (context_token, ticket)
+        self._searched = 0  # 最近一次 _chat 里实际搜了几次
 
     # ================= 状态 =================
     @property
@@ -59,6 +66,43 @@ class Bot:
         st["out"] += u.completion_tokens
         st["calls"] += 1
         self.store.set("usage", st)
+
+    def _count_search(self) -> None:
+        st = self.store.get("usage", {})
+        st["searches"] = st.get("searches", 0) + 1
+        self.store.set("usage", st)
+
+    async def _chat(self, messages: list[dict], force_search: bool = False) -> LLMResult:
+        """调模型；它要上网查就帮它查，最多 max_rounds 轮，最后一轮不许再查，逼它直接说。
+        force_search 时第一轮必须先查一次（光是"建议"它去查，它多半不查）。"""
+        if not self.web:
+            res = await self.llm.chat(messages)
+            self._add_usage(res.usage)
+            return res
+        rounds = self.cfg.web.max_rounds
+        self._searched = 0
+        for i in range(rounds + 1):
+            choice = "none" if i == rounds else ("required" if force_search and i == 0 else None)
+            res = await self.llm.chat(messages, tools=[SEARCH_TOOL], tool_choice=choice)
+            self._add_usage(res.usage)
+            if not res.tool_calls or i == rounds:
+                return res
+            self._searched += len(res.tool_calls)
+            outs = await asyncio.gather(*(self._run_tool(c) for c in res.tool_calls))
+            messages = messages + [res.assistant_message()] + [
+                {"role": "tool", "tool_call_id": c.get("id", ""), "content": out} for c, out in zip(res.tool_calls, outs)]
+        return res
+
+    async def _run_tool(self, call: dict) -> str:
+        fn = call.get("function") or {}
+        if fn.get("name") != "web_search":
+            return f"没有叫 {fn.get('name')} 的工具。"
+        try:
+            query = json.loads(fn.get("arguments") or "{}").get("query", "")
+        except json.JSONDecodeError:
+            query = ""
+        self._count_search()
+        return await self.web.search(query)
 
     # ================= 收消息 =================
     async def handle_inbound(self, msg: dict) -> None:
@@ -104,7 +148,8 @@ class Bot:
             rate = (u.get("hit", 0) / u["prompt"] * 100) if u.get("prompt") else 0
             notes = len(self.store.active_notes())
             msg = (f"今天调用 {u.get('calls', 0)} 次，输入 {u.get('prompt', 0)} token（缓存命中 {rate:.0f}%），"
-                   f"输出 {u.get('out', 0)} token。\n零碎记忆 {notes} 条，当前额度还剩 {self.replies_left() - 1} 条。")
+                   f"输出 {u.get('out', 0)} token，联网搜索 {u.get('searches', 0)} 次。\n"
+                   f"零碎记忆 {notes} 条，当前额度还剩 {self.replies_left() - 1} 条。")
             await self.send_bubbles([msg], kind="system", store=False)
             return True
         if t in ("/记忆", "/memory"):
@@ -175,11 +220,10 @@ class Bot:
         # "正在输入"和生成回复同时进行，不让它拖慢回复；发完再收起
         typing = asyncio.create_task(self._start_typing())
         try:
-            res = await self.llm.chat(self.memory.build_reply_messages())
+            res = await self._chat(self.memory.build_reply_messages())
         finally:
             ticket = await typing
         try:
-            self._add_usage(res.usage)
             newest = self.store.last_message()
             if newest and newest.id != snapshot:
                 # 生成期间他又发了新消息：像真人一样，看完再回
@@ -305,14 +349,15 @@ class Bot:
         if not d.ok:
             log.debug("不主动：%s", d.reason)
             return False
-        res = await self.llm.chat(self.memory.build_proactive_messages(d.situation))
-        self._add_usage(res.usage)
+        nudge = bool(self.web) and random.random() < self.cfg.web.proactive_search_chance
+        res = await self._chat(self.memory.build_proactive_messages(d.situation, nudge_search=nudge), force_search=nudge)
         due_ids = [f.id for f in st.followups]
         if PASS_TOKEN in res.text or not res.text.strip():
             log.info("模型决定这次不打扰")
             return False
+        text = res.text if self._searched else NOT_SEARCHED.sub("突然想到", res.text)
         # 主动消息可以连发多条；额度不够时 send_bubbles 会把剩下的合并
-        bubbles = split_bubbles(strip_markdown(res.text), self.cfg.proactive.max_bubbles)
+        bubbles = split_bubbles(strip_markdown(text), self.cfg.proactive.max_bubbles)
         sent = await self.send_bubbles(bubbles, kind="proactive")
         if sent:
             day = datetime.now(self.memory.tz).strftime("%Y-%m-%d")

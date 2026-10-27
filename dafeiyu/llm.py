@@ -31,6 +31,15 @@ class Usage:
 class LLMResult:
     text: str
     usage: Usage = field(default_factory=Usage)
+    # 模型要求调用的工具（OpenAI 格式），没有就是空
+    tool_calls: list[dict] = field(default_factory=list)
+
+    def assistant_message(self) -> dict:
+        """把这次回复（含工具调用）原样接回对话，供下一轮使用。"""
+        msg: dict = {"role": "assistant", "content": self.text}
+        if self.tool_calls:
+            msg["tool_calls"] = self.tool_calls
+        return msg
 
 
 class LLM:
@@ -41,7 +50,8 @@ class LLM:
         self._http = http or httpx.AsyncClient()
 
     async def chat(self, messages: list[dict], *, model: str | None = None, temperature: float | None = None,
-                   max_tokens: int | None = None, json_mode: bool = False) -> LLMResult:
+                   max_tokens: int | None = None, json_mode: bool = False,
+                   tools: list[dict] | None = None, tool_choice: str | None = None) -> LLMResult:
         body = {
             "model": model or self.cfg.chat_model,
             "messages": messages,
@@ -53,6 +63,11 @@ class LLM:
         }
         if json_mode:
             body["response_format"] = {"type": "json_object"}
+        if tools:
+            # 工具定义也是前缀的一部分，每轮都原样带上才能命中缓存；不想让它再调就用 tool_choice=none
+            body["tools"] = tools
+            if tool_choice:
+                body["tool_choice"] = tool_choice
         t0 = time.monotonic()
         resp = await self._http.post(
             self.cfg.base_url.rstrip("/") + "/chat/completions",
@@ -70,9 +85,12 @@ class LLM:
             cache_miss=u.get("prompt_cache_miss_tokens", 0),
             completion_tokens=u.get("completion_tokens", 0),
         )
-        text = (data["choices"][0]["message"].get("content") or "").strip()
-        log.info("LLM %s | %s | 耗时 %.2fs", body["model"], usage, time.monotonic() - t0)
-        return LLMResult(text=text, usage=usage)
+        msg = data["choices"][0]["message"]
+        text = (msg.get("content") or "").strip()
+        calls = msg.get("tool_calls") or []
+        log.info("LLM %s | %s | 耗时 %.2fs%s", body["model"], usage, time.monotonic() - t0,
+                 f" | 调用工具 {len(calls)} 个" if calls else "")
+        return LLMResult(text=text, usage=usage, tool_calls=calls)
 
     async def chat_json(self, messages: list[dict], **kw) -> dict:
         res = await self.chat(messages, json_mode=True, temperature=kw.pop("temperature", 0.3), **kw)

@@ -37,6 +37,12 @@ check_min_min = 25
 check_max_min = 70
 max_bubbles = 5              # 一次主动最多连发几条
 
+[web]
+enabled = true               # 联网搜索（DeepSeek Search API，和聊天共用 api_key，约 $0.75/千次）
+count = 5                    # 每次搜几条结果（不影响价格）
+max_rounds = 2               # 一次回复里最多搜几轮
+proactive_search_chance = 0.5  # 主动找你时，多大概率先去查查你感兴趣的方向有没有新东西
+
 [ilink]
 replies_per_token = 9        # 每收到你一条消息，最多能回几条（平台约 10 条）
 rate_window_s = 300

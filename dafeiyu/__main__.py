@@ -48,12 +48,13 @@ async def cmd_run(cfg) -> None:
     from .ilink import Account, ILinkClient
     from .llm import LLM
     from .store import Store
+    from .web import Web
     if not cfg.account_file.exists():
         sys.exit("还没绑定微信，先运行：python -m dafeiyu login")
     acc = Account.from_dict(json.loads(cfg.account_file.read_text(encoding="utf-8")))
     ilink = ILinkClient(acc.base_url, token=acc.bot_token, bot_agent=cfg.ilink.bot_agent)
     llm = LLM(cfg.llm)
-    bot = Bot(cfg, acc, ilink, llm, Store(cfg.db_file))
+    bot = Bot(cfg, acc, ilink, llm, Store(cfg.db_file), web=Web(cfg.llm, cfg.web))
     try:
         await bot.run()
     finally:

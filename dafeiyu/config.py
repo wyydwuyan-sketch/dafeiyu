@@ -82,6 +82,19 @@ class ILinkConfig:
 
 
 @dataclass
+class WebConfig:
+    # 联网搜索（DeepSeek Search API，和聊天共用 api_key）
+    enabled: bool = True
+    # 每次搜几条结果（不影响价格）
+    count: int = 5
+    # 一次回复里最多搜几轮，超过就让模型直接回答
+    max_rounds: int = 2
+    timeout_s: float = 15.0
+    # 主动找他时，有多大概率提示模型去查查他感兴趣的方向有没有新东西
+    proactive_search_chance: float = 0.5
+
+
+@dataclass
 class Config:
     data_dir: Path = Path("data")
     persona_file: Path = Path("persona.md")
@@ -91,6 +104,7 @@ class Config:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     proactive: ProactiveConfig = field(default_factory=ProactiveConfig)
     ilink: ILinkConfig = field(default_factory=ILinkConfig)
+    web: WebConfig = field(default_factory=WebConfig)
 
     @property
     def profile_file(self) -> Path:

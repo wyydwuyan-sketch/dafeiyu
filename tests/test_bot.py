@@ -24,14 +24,18 @@ class FakeLLM:
         self.replies = list(replies or [])
         self.json_replies = list(json_replies or [])
         self.calls = []
+        self.kwargs = []
         self.on_call = None
 
     async def chat(self, messages, **kw):
         self.calls.append(messages)
+        self.kwargs.append(kw)
         if self.on_call:
             await self.on_call()
-        text = self.replies.pop(0) if self.replies else "嗯"
-        return LLMResult(text=text, usage=Usage(prompt_tokens=100, cache_hit=80, completion_tokens=10))
+        reply = self.replies.pop(0) if self.replies else "嗯"
+        if isinstance(reply, LLMResult):  # 想模拟工具调用时直接给 LLMResult
+            return reply
+        return LLMResult(text=reply, usage=Usage(prompt_tokens=100, cache_hit=80, completion_tokens=10))
 
     async def chat_json(self, messages, **kw):
         self.calls.append(messages)
@@ -61,6 +65,21 @@ class FakeILink:
         pass
 
 
+class FakeWeb:
+    def __init__(self, result="1. 金铲铲新赛季上线（官网，2026-10-26）\n新赛季今天开放"):
+        self.result = result
+        self.queries = []
+
+    async def search(self, query):
+        self.queries.append(query)
+        return self.result
+
+
+def search_call(query, cid="call_1"):
+    return {"id": cid, "type": "function",
+            "function": {"name": "web_search", "arguments": json.dumps({"query": query}, ensure_ascii=False)}}
+
+
 class Clock:
     def __init__(self, t):
         self.t = t
@@ -73,14 +92,14 @@ async def no_sleep(_s):
     return None
 
 
-def make_bot(tmp_path, llm=None, clock=None):
+def make_bot(tmp_path, llm=None, clock=None, web=None):
     cfg = Config()
     cfg.data_dir = tmp_path
-    cfg.persona_file = Path(__file__).parent.parent / "persona.md"
+    cfg.persona_file = Path(__file__).parent.parent / "persona.example.md"
     clock = clock or Clock(time.time())
     store = Store(tmp_path / "bot.db")
     acc = Account(bot_token="tk", bot_id="b@im.bot", base_url="https://x", owner_user_id="me@im.wechat")
-    bot = Bot(cfg, acc, FakeILink(), llm or FakeLLM(), store, clock=clock, sleep=no_sleep)
+    bot = Bot(cfg, acc, FakeILink(), llm or FakeLLM(), store, clock=clock, sleep=no_sleep, web=web)
     return bot
 
 
@@ -259,6 +278,93 @@ def test_quota_merges_remaining_bubbles(tmp_path):
 
     asyncio.run(go())
     assert [t for _, t, _ in bot.ilink.sent] == ["a", "b\nc"]
+
+
+# ---------------- 联网 ----------------
+def test_reply_searches_then_answers(tmp_path):
+    web = FakeWeb()
+    llm = FakeLLM(replies=[LLMResult(text="", tool_calls=[search_call("金铲铲 新赛季")]), "新赛季今天开了 冲不冲"])
+    bot = make_bot(tmp_path, llm=llm, web=web)
+
+    async def go():
+        await bot.handle_inbound(user_msg("金铲铲是不是更新了"))
+        return await bot.reply_once()
+
+    assert asyncio.run(go())
+    assert web.queries == ["金铲铲 新赛季"]
+    assert [t for _, t, _ in bot.ilink.sent] == ["新赛季今天开了 冲不冲"]
+    second = llm.calls[1]
+    assert second[-2]["tool_calls"][0]["id"] == "call_1"  # 工具调用和结果都接回了对话
+    assert second[-1] == {"role": "tool", "tool_call_id": "call_1", "content": web.result}
+    assert llm.kwargs[0]["tools"] == llm.kwargs[1]["tools"]  # 工具定义每轮一样，缓存前缀不变
+    # 搜索结果不进聊天记录
+    assert [m.role for m in bot.store.messages_after(0)] == ["user", "assistant"]
+    assert bot.store.get("usage")["searches"] == 1
+
+
+def test_search_rounds_are_capped(tmp_path):
+    web = FakeWeb()
+    keeps_searching = [LLMResult(text="", tool_calls=[search_call(f"q{i}", f"c{i}")]) for i in range(5)]
+    llm = FakeLLM(replies=keeps_searching)
+    bot = make_bot(tmp_path, llm=llm, web=web)
+    res = asyncio.run(bot._chat([{"role": "user", "content": "查查"}]))
+    assert len(web.queries) == bot.cfg.web.max_rounds
+    assert llm.kwargs[-1]["tool_choice"] == "none"  # 最后一轮不许再查
+    assert len(llm.calls) == bot.cfg.web.max_rounds + 1
+
+
+def test_force_search_requires_tool_on_first_round_only(tmp_path):
+    web = FakeWeb()
+    llm = FakeLLM(replies=[LLMResult(text="", tool_calls=[search_call("明日方舟 新卡池")]), "新池子是个狙"])
+    bot = make_bot(tmp_path, llm=llm, web=web)
+    asyncio.run(bot._chat([{"role": "user", "content": "主动"}], force_search=True))
+    assert [kw["tool_choice"] for kw in llm.kwargs] == ["required", None]
+
+
+def test_proactive_without_search_cannot_claim_it_just_saw_something(tmp_path):
+    clock = Clock(_ts(10))
+    llm = FakeLLM(replies=["刚刷到一个冷知识：海豚半脑睡觉"])
+    bot = make_bot(tmp_path, llm=llm, clock=clock, web=FakeWeb())
+    bot.cfg.web.proactive_search_chance = 0  # 这次不强制搜
+
+    async def go():
+        await bot.handle_inbound(user_msg("忙"))
+        clock.t = _ts(15)
+        return await bot.try_proactive()
+
+    assert asyncio.run(go())
+    assert bot.ilink.sent[-1][1] == "突然想到一个冷知识：海豚半脑睡觉"
+
+
+def test_no_web_means_no_tools(tmp_path):
+    llm = FakeLLM(replies=["嗯"])
+    bot = make_bot(tmp_path, llm=llm)
+
+    async def go():
+        await bot.handle_inbound(user_msg("在吗"))
+        return await bot.reply_once()
+
+    assert asyncio.run(go())
+    assert "tools" not in llm.kwargs[0]
+
+
+def test_search_failure_does_not_break_reply(tmp_path):
+    from dafeiyu.web import Web
+
+    def boom(request):
+        raise httpx.ConnectError("down")
+
+    web = Web(Config().llm, Config().web, http=httpx.AsyncClient(transport=httpx.MockTransport(boom)))
+    out = asyncio.run(web.search("杭州天气"))
+    assert "没搜成" in out
+
+
+def test_search_results_are_compact():
+    from dafeiyu.web import format_results
+    out = format_results([{"title": "杭州天气", "site_name": "天气网", "date": "2026-10-27T00:00:00+00:00",
+                           "summary": "多云转晴 " * 100}])
+    assert out.startswith("1. 杭州天气（天气网，2026-10-27）")
+    assert len(out) < 400
 
 
 def test_chat_replies_not_held_by_rate_limiter(tmp_path):
