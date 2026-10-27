@@ -1,0 +1,43 @@
+# 复制成 config.toml 再改。所有项都有默认值，最少只需要填 api_key。
+
+data_dir = "data"            # 聊天记录、记忆、微信凭据都放这里，记得备份
+persona_file = "persona.md"  # 人设，随便改
+timezone = "Asia/Shanghai"
+
+[llm]
+api_key = ""                 # DeepSeek API Key，也可以用环境变量 DEEPSEEK_API_KEY
+base_url = "https://api.deepseek.com"
+chat_model = "deepseek-flash"
+memory_model = "deepseek-flash"   # 记忆提炼/整理用，想更准可换 deepseek-v4-pro
+temperature = 1.0            # 再高容易冒出怪词
+max_tokens = 600
+
+[chat]
+debounce_s = 1.0             # 你连发消息时，等你停 1 秒再回
+max_bubbles = 3              # 一次最多拆成几条发
+typing_s_per_char = 0.06     # 模拟打字速度（秒/字），影响第二条起的间隔
+history_max_messages = 40    # 上下文保留多少条原始消息
+history_compact_batch = 20   # 超出后一次压缩多少条进摘要
+
+[memory]
+profile_max_chars = 1500     # 核心画像上限，每次都会带上
+retrieve_top_k = 6           # 每次检索带几条相关记忆
+extract_idle_min = 10        # 聊天停下 10 分钟后提炼记忆
+consolidate_hour = 4         # 每天凌晨 4 点整理核心画像
+
+[proactive]
+enabled = true
+active_start = "09:00"
+active_end = "23:00"
+min_silence_h = 3.0          # 安静多久才考虑主动找你
+window_h = 22.0              # 只在你最近一次说话后 22 小时内主动（平台 24 小时窗口）
+max_unanswered = 1           # 你没回之前最多主动几次
+daily_max = 3
+check_min_min = 25
+check_max_min = 70
+max_bubbles = 5              # 一次主动最多连发几条
+
+[ilink]
+replies_per_token = 9        # 每收到你一条消息，最多能回几条（平台约 10 条）
+rate_window_s = 300
+rate_max_sends = 6           # 只约束主动消息：5 分钟内最多 6 条；回复不预先限速

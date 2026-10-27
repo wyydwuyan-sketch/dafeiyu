@@ -1,0 +1,3 @@
+httpx>=0.27
+qrcode>=7.4
+tomli>=2.0; python_version < "3.11"

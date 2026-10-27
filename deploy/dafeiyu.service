@@ -1,0 +1,19 @@
+[Unit]
+Description=DaFeiYu - DeepSeek chat bot on WeChat (iLink)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 改成你实际的用户和路径
+User=dafeiyu
+WorkingDirectory=/opt/dafeiyu
+ExecStart=/opt/dafeiyu/.venv/bin/python -m dafeiyu run
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+# 推荐把 DeepSeek Key 放在只有 root 能读的文件里（内容：DEEPSEEK_API_KEY=sk-...），而不是写进 config.toml
+# EnvironmentFile=/etc/dafeiyu.env
+
+[Install]
+WantedBy=multi-user.target
