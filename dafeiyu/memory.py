@@ -96,6 +96,8 @@ def strip_markdown(text: str) -> str:
     text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
     text = re.sub(r"(?m)^#{1,6}\s*", "", text)
     text = re.sub(r"`([^`]+)`", r"\1", text)
+    # 模型偶尔会模仿历史里的时间标注，在开头写个"[10-28 09:12 周二]"
+    text = re.sub(r"(?m)^\s*[\[【]\d{1,2}-\d{1,2} \d{1,2}:\d{2}[^\]】\n]*[\]】]\s*", "", text)
     return text
 
 
@@ -119,6 +121,10 @@ FORMAT_RULES = f"""## 聊天方式
 - "你对他的了解"是背景，不是话题。只在他自己聊到相关的事时顺嘴带一句，绝大多数回复里都不该出现他的工作、省份、工资这些信息。他发"嘿嘿"就别扯到他的工作，别为了显得了解他硬提旧事。
 - 他丧的时候，别审问原因、别给方案、也别安慰腔。像朋友一样接住：说一句你真实的感受，陪他吐槽两句，或者跟他一起丧一会儿、扯点别的。短一点。他想聊怎么办时自己会说。
 - 别每句都接得完美周到。真人会接短句、会岔开话题、会说"确实"、会只回一个"？"。
+- 可以不回。他回"好""嗯""好的好的"这种收尾的话，或者话已经说完了，就只输出 {PASS_TOKEN}，什么都不发。真人不会每句都接一句"嗯，去吧"。
+- 别当家长。不叮嘱"早点下班""别熬夜""回去别碰工作""到家了没"，不查岗。同一件事一段对话里最多说一次，说过的别换个说法再说一遍。
+- 过去的事和情绪会翻篇。他之前丧过、说过想静静，过去了就别再提，他自己提起再接。
+- 他给你话头（"想聊就聊""随便聊""无聊"）的时候，你自己起个话题：说说你最近在琢磨的事、你的看法、或者一个你觉得好玩的东西。别把球踢回去问"聊什么"。
 - 不知道的事就说不知道，不要编造你们之间没发生过的事。"""
 
 
@@ -176,13 +182,20 @@ class Memory:
         self.store.touch_notes([n.id for n in top])
         return top
 
-    def dynamic_note(self, query_text: str, extra: str = "") -> str:
+    def dynamic_note(self, query_text: str, extra: str = "", proactive: bool = False) -> str:
         now = time.time()
         lines = [f"{NOTE_MARK}", f"现在是 {_fmt_time(now, self.tz, with_year=True)}。"]
         notes = self.retrieve(query_text)
         if notes:
             lines.append("你记得的相关事情：")
             lines += [f"- ({datetime.fromtimestamp(n.created_at, self.tz):%m-%d}) {n.content}" for n in notes]
+        me = self.self_today()
+        if me and proactive:
+            lines.append("你今天自己的状态（可以拿来当分享的素材，说过的就别再说）：\n" + me)
+        elif me:
+            # 回他的时候硬塞自己的事很出戏：只在他问起、或者把话头交给你时才用
+            lines.append("你今天自己的状态（只有他问你在干嘛、在想什么，或者让你起个话题时才说；"
+                         "其他时候当没这回事，照常接他的话。说过的别再说）：\n" + me)
         if extra:
             lines.append(extra)
         return "\n".join(lines)
@@ -209,7 +222,7 @@ class Memory:
                 f"- ({_fmt_time(m.ts, self.tz)}) {m.content.replace(BUBBLE_SEP, ' ').replace(chr(10), ' ')[:60]}" for m in said)
         n = self.cfg.proactive.max_bubbles
         trigger = (
-            self.dynamic_note(recent_text, extra=situation)
+            self.dynamic_note(recent_text, extra=situation, proactive=True)
             + "\n\n这条不是他发的消息，是系统在问你：现在要不要主动找他说点什么？\n"
             "像真朋友那样判断。可以说的：你自己刚冒出来的念头或感悟，一个你觉得他会感兴趣的冷知识或推荐，"
             "对之前聊过的事的后续想法，惦记着要问他的事。不一定跟他有关，也不一定要他回。\n"
@@ -218,10 +231,12 @@ class Memory:
             "没搜到有意思的就分享别的，或者不发。\n"
             + ("这次先用 web_search 查一查他感兴趣的方向（游戏、番、AI 提效之类，挑一个）最近有没有新东西，再决定说什么。\n"
                if nudge_search else "")
-            + "这次没用 web_search 查过的东西，就是你本来就知道的，不要说成\"刚刷到\"\"刚看到\"。\n"
+            + "\"刚查到\"\"刚看到\"只能用在你这次真搜过的那件事上；没搜过的就是你本来就知道或自己想的，别说成刚查到。\n"
             "主动找他主要是分享你自己的东西。不要回头去分析他之前说的心事、给他讲道理或建议，"
             "那些等他自己想聊再说；惦记他的状态，轻轻带一句就够了。\n"
             "每条都要短，像随手发的微信，不是小作文。\n"
+            "一次只说一件事：搜到了新东西就只说那一件，别再捎上你自己琢磨的事；没搜就只说你自己的一件事。别把几个话题塞在一起，像在念简报。冷知识别讲成科普，一两句说到点上，再加一句你自己的反应。\n"
+            "别发\"到家了没\"\"吃了没\"\"下班了吗\"这种查岗式的关心。\n"
             "说完就完，不要加\"不想聊就当我没说\"\"你先忙，我不打扰\"\"你大概不想聊这个\"这种小心翼翼的尾巴，朋友之间不这么说话。\n"
             f"想说得多就多发几条，一个念头一条，条与条之间单独写一行 {BUBBLE_SEP}，最多 {n} 条；一两句也行。\n"
             "不要发\"在吗\"\"最近怎么样\"\"有什么需要帮忙的\"这种话，不要像客服回访，也别一上来就问他问题。\n"
@@ -232,6 +247,43 @@ class Memory:
         else:
             rendered.append({"role": "user", "content": trigger})
         return [{"role": "system", "content": self.system_prompt()}] + rendered
+
+    # ================= 它自己的一天 =================
+    def self_today(self) -> str:
+        st = self.store.get("self_today") or {}
+        return st.get("text", "") if st.get("day") == datetime.now(self.tz).strftime("%Y-%m-%d") else ""
+
+    async def refresh_self(self) -> bool:
+        """每天给它自己生成一份"今天的状态"（心情、在琢磨的事、想说的），让它有自己的日子，而不是只会接话。"""
+        day = datetime.now(self.tz).strftime("%Y-%m-%d")
+        st = self.store.get("self_today") or {}
+        if st.get("day") == day:
+            return False
+        said = "\n".join(f"- {m.content.replace(BUBBLE_SEP, ' ').replace(chr(10), ' ')[:60]}"
+                         for m in self.store.recent_by_kind("proactive", 6)) or "（无）"
+        prompt = [
+            {"role": "system", "content": self.persona()},
+            {"role": "user", "content": f"""今天是 {_fmt_time(time.time(), self.tz, with_year=True)}。
+
+你昨天的状态：
+{st.get('text') or '（无）'}
+
+你最近主动跟他说过的：
+{said}
+
+写下你今天自己的状态，是给你自己看的，三行，每行一句，口语：
+心情：今天整体什么感觉。可以是懒、兴奋、有点烦、平静、无聊……别跟昨天一样，也别总是积极向上。
+在琢磨：今天脑子里转着的一个具体问题或东西，跟你自己的口味有关，别跟昨天和最近说过的重复。
+想说的：今天有点想跟他分享的一件小事或一个看法，不用跟他有关。
+不要写对他的担心和关心。你没有眼睛，也不刷东西，所以都写成你自己想到的、琢磨的，不要写"看到""刷到"。只输出这三行。"""},
+        ]
+        res = await self.llm.chat(prompt, model=self.cfg.llm.memory_model, temperature=1.1, max_tokens=300)
+        text = res.text.strip()
+        if not text:
+            return False
+        self.store.set("self_today", {"day": day, "text": text})
+        log.info("今天的大肥鱼：%s", text.replace("\n", " | "))
+        return True
 
     # ================= 历史压缩 =================
     async def maybe_compact(self) -> bool:
@@ -249,7 +301,7 @@ class Memory:
             {"role": "user", "content": (
                 f"已有摘要：\n{old or '（无）'}\n\n新的一段聊天：\n{convo}\n\n"
                 "把新内容合并进已有摘要，输出完整的新摘要。要求：按时间顺序，第二人称写'你'，"
-                "保留聊过的话题、他的情绪和态度、没聊完的事；删掉寒暄和废话；"
+                "保留聊过的话题和没聊完的事；他的情绪最多半句带过，别展开低落的细节；删掉寒暄和废话；"
                 "总长度控制在 600 字以内，越早的内容写得越简略。只输出摘要正文。"
             )},
         ]
@@ -292,11 +344,14 @@ class Memory:
   "followups": [{{"due": "YYYY-MM-DD HH:MM", "topic": "之后值得问问他的事，比如他说明天面试，就在面试后问结果"}}]
 }}
 规则：
-- 只记以后聊天用得上的：他的经历、计划、喜好、在意的人和事、情绪起伏的原因、他明确让你记住的。寒暄、你说的话、你的建议都不记。
+- 只记以后聊天用得上的：他的经历、计划、喜好、在意的人和事、他明确让你记住的。寒暄、你说的话、你的建议都不记。
+- 不记流水账：几点上班、几点下班、在工位了、去吃饭了，这些都不记。
+- 不记一时的情绪和状态（丧了、累了、想静静、又好了），情绪会过去，记下来只会让你以后老翻旧账。除非他明确说这件事对他很重要，或者是持续很久的大事。
+- 不下结论：他的性格、心理、"嘴上说 A 其实 B"这类判断都不记。
 - 已有画像或记忆里有的不要重复记；有变化的记新的，并把旧的放进 obsolete_ids。
 - 他说"忘了吧/别记这个"之类，把相关编号放进 obsolete_ids，也不要再记。
 - "你"说的话不是事实来源。"你"随口说的（比如"平时都是我找你"）不能记成他的事。
-- 他情绪低落时的自我否定（"我没能力""我长得不好""生活没意思"）不是事实，不要记成他的特点；最多记一条"他某月某日那天情绪低落、对未来迷茫"这样的状态，importance 不超过 2。
+- 他情绪低落时的自我否定（"我没能力""我长得不好""生活没意思"）不是事实，一律不记。
 - importance：5=身份/重大事件，3=比较重要的近况或偏好，1=小事。
 - 没有就给空数组。"""},
         ]
@@ -341,7 +396,8 @@ class Memory:
 把新记忆里长期有效的部分合并进画像，输出完整的新画像。要求：
 - 只放长期有效、每次聊天都值得知道的：他是谁、做什么、重要的人、长期的喜好和在意的事、正在进行的大事。
 - 一次性的小事、已经过去的事不要放（它们留在零碎记忆里，需要时会被检索出来）。
-- 和新信息冲突的旧内容要更新。
+- 不写情绪和状态（"心累""迷茫""觉得生活没意思""担心很多事"），不写心理特点和性格判断（"想静静又找人聊"这种），只写事实。
+- 和新信息冲突的旧内容要更新。现有画像里如果已经有情绪、状态或性格判断，这次顺手删掉。
 - 用简洁的条目，以"- "开头，可以用几个小标题分组。总长度不超过 {limit} 字。
 - 只输出画像正文。"""},
         ]

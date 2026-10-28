@@ -230,6 +230,10 @@ class Bot:
                 log.info("生成期间有新消息，重新组织回复")
                 self._new_msg.set()
                 return False
+            if PASS_TOKEN in res.text:
+                # 他说的是"好""嗯"这类收尾的话，真人不会每句都接
+                log.info("这句不回了")
+                return False
             bubbles = split_bubbles(strip_markdown(res.text), self.cfg.chat.max_bubbles)
             if not bubbles:
                 return False
@@ -391,6 +395,8 @@ class Bot:
             await self.memory.maybe_compact()
         local = datetime.fromtimestamp(now, self.memory.tz)
         today = local.strftime("%Y-%m-%d")
+        if local.hour >= 6:
+            await self.memory.refresh_self()  # 每天早上生成一次它自己今天的状态
         if local.hour == self.cfg.memory.consolidate_hour and self.store.get("consolidated_day") != today:
             await self.memory.extract()
             await self.memory.consolidate()

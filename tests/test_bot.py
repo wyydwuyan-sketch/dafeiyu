@@ -10,7 +10,7 @@ from dafeiyu.bot import Bot
 from dafeiyu.config import Config
 from dafeiyu.ilink import (ILinkClient, ILinkError, Account, extract_text, _client_version, RateLimiter)
 from dafeiyu.llm import LLMResult, Usage, parse_json_loose
-from dafeiyu.memory import Memory, grams, split_bubbles, NOTE_MARK
+from dafeiyu.memory import Memory, grams, split_bubbles, strip_markdown, NOTE_MARK
 from dafeiyu.proactive import ProactiveState, decide
 from dafeiyu.store import Store, Followup
 from zoneinfo import ZoneInfo
@@ -198,6 +198,12 @@ def test_retrieve_finds_relevant_note(tmp_path):
     assert "面试" in grams("面试准备")
 
 
+def test_strip_copied_timestamps():
+    assert strip_markdown("【10-28 09:12】\n昨天几点走的") == "昨天几点走的"
+    assert strip_markdown("[10-27 18:00 周一] 收工") == "收工"
+    assert strip_markdown("明天 10-28 09:00 开会") == "明天 10-28 09:00 开会"  # 句中的时间不动
+
+
 def test_split_bubbles():
     assert split_bubbles("哈哈\n---\n真的假的\n---\n离谱", 3) == ["哈哈", "真的假的", "离谱"]
     assert split_bubbles("a\n---\nb\n---\nc\n---\nd", 3) == ["a", "b", "c\nd"]
@@ -334,6 +340,41 @@ def test_proactive_without_search_cannot_claim_it_just_saw_something(tmp_path):
 
     assert asyncio.run(go())
     assert bot.ilink.sent[-1][1] == "突然想到一个冷知识：海豚半脑睡觉"
+
+
+# ---------------- 活人感 ----------------
+def test_can_choose_not_to_reply(tmp_path):
+    llm = FakeLLM(replies=["<PASS>"])
+    bot = make_bot(tmp_path, llm=llm)
+
+    async def go():
+        await bot.handle_inbound(user_msg("好的好的"))
+        return await bot.reply_once()
+
+    assert asyncio.run(go()) is False
+    assert bot.ilink.sent == []
+    assert [m.role for m in bot.store.messages_after(0)] == ["user"]
+
+
+def test_daily_self_state_generated_once_and_shown(tmp_path):
+    llm = FakeLLM(replies=["心情：有点懒\n在琢磨：章鱼到底算不算聪明\n想说的：今天想吃火锅（虽然吃不了）"])
+    bot = make_bot(tmp_path, llm=llm)
+    assert asyncio.run(bot.memory.refresh_self())
+    assert not asyncio.run(bot.memory.refresh_self())  # 同一天只生成一次
+    assert len(llm.calls) == 1
+    bot.store.add_message("user", "在干嘛")
+    last = bot.memory.build_reply_messages()[-1]["content"]
+    assert "章鱼到底算不算聪明" in last  # 只放在最后一条，不影响缓存前缀
+    assert "章鱼" not in bot.memory.system_prompt()
+
+
+def test_extract_prompt_skips_moods_and_logs(tmp_path):
+    llm = FakeLLM(json_replies=[{"notes": []}])
+    bot = make_bot(tmp_path, llm=llm)
+    bot.store.add_message("user", "下班了，今天好累")
+    asyncio.run(bot.memory.extract())
+    rules = llm.calls[0][-1]["content"]
+    assert "不记流水账" in rules and "不记一时的情绪" in rules
 
 
 def test_no_web_means_no_tools(tmp_path):
